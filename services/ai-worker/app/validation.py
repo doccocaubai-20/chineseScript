@@ -45,15 +45,8 @@ def validate_learning_json(video: dict[str, Any], segments: list[dict[str, Any]]
             errors.append(f"{prefix} duplicates an earlier segment")
         seen.add(duplicate_key)
 
-        hanzi_count = len(re.findall(r"[\u4e00-\u9fff]", hanzi))
-        pinyin_count = len(
-            re.findall(
-                r"[a-zA-Zāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]+",
-                pinyin,
-            )
-        )
-        if hanzi_count and pinyin_count < hanzi_count:
-            errors.append(f"{prefix}.pinyin does not contain enough syllables for Hanzi")
+        if not re.search(r"[a-zA-Zāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]", pinyin):
+            errors.append(f"{prefix}.pinyin must contain Latin letters or tone marks")
 
     if video.get("totalSentences") != len(segments):
         errors.append("totalSentences must equal segments.length")

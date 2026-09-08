@@ -4,7 +4,7 @@ import {
   ServiceUnavailableException,
 } from "@nestjs/common";
 import { VideoSourceType } from "@prisma/client";
-import { IsUrl } from "class-validator";
+import { IsArray, IsUrl } from "class-validator";
 import { PrismaService } from "./prisma.service";
 
 export class CreateYouTubeVideoDto {
@@ -50,6 +50,11 @@ interface SegmentResult {
   vi: string;
 }
 
+export class UpdateSegmentsDto {
+  @IsArray()
+  segments!: SegmentResult[];
+}
+
 function isYouTubeUrl(sourceUrl: string): boolean {
   try {
     const url = new URL(sourceUrl);
@@ -73,7 +78,7 @@ export class VideosService {
     let response: Response;
     try {
       response = await fetch(
-        `${process.env.AI_WORKER_URL ?? "http://localhost:8000"}/youtube/metadata`,
+        `${process.env.AI_WORKER_URL ?? "http://127.0.0.1:8000"}/youtube/metadata`,
         {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -92,8 +97,16 @@ export class VideosService {
     }
 
     const metadata = (await response.json()) as YouTubeMetadata;
-    return this.prisma.video.create({
-      data: {
+    const video = await this.prisma.video.upsert({
+      where: { youtubeId: metadata.youtube_id },
+      update: {
+        sourceUrl: metadata.source_url,
+        title: metadata.title,
+        channel: metadata.channel ?? undefined,
+        durationSec: metadata.duration_sec ?? undefined,
+        thumbnailUrl: metadata.thumbnail_url ?? undefined,
+      },
+      create: {
         sourceType: VideoSourceType.YOUTUBE,
         youtubeId: metadata.youtube_id,
         sourceUrl: metadata.source_url,
@@ -103,6 +116,7 @@ export class VideosService {
         thumbnailUrl: metadata.thumbnail_url ?? undefined,
       },
     });
+    return this.get(video.id);
   }
 
   async downloadMedia(videoId: string) {
@@ -114,7 +128,7 @@ export class VideosService {
     let response: Response;
     try {
       response = await fetch(
-        `${process.env.AI_WORKER_URL ?? "http://localhost:8000"}/youtube/download`,
+        `${process.env.AI_WORKER_URL ?? "http://127.0.0.1:8000"}/youtube/download`,
         {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -219,11 +233,84 @@ export class VideosService {
     });
   }
 
+  async updateSegments(videoId: string, segments: SegmentResult[]) {
+    const video = await this.prisma.video.findUnique({ where: { id: videoId } });
+    if (!video) throw new BadRequestException("Video not found");
+    const duration = video.durationSec;
+    if (duration == null || duration <= 0) {
+      throw new BadRequestException("Video duration is required before saving segments");
+    }
+    for (const [index, segment] of segments.entries()) {
+      if (
+        segment.id !== index + 1 ||
+        !Number.isFinite(segment.start) ||
+        !Number.isFinite(segment.end) ||
+        segment.start < 0 ||
+        segment.start >= segment.end ||
+        segment.end > duration ||
+        !segment.hanzi?.trim() ||
+        !segment.pinyin?.trim() ||
+        !segment.vi?.trim()
+      ) {
+        throw new BadRequestException(`Invalid segment at index ${index}`);
+      }
+      const previous = segments[index - 1];
+      if (previous && segment.start < previous.end - 0.25) {
+        throw new BadRequestException(`Segment ${index + 1} overlaps the previous segment`);
+      }
+    }
+    await this.prisma.$transaction([
+      this.prisma.segment.deleteMany({ where: { videoId } }),
+      ...segments.map((segment, index) => this.prisma.segment.create({
+        data: {
+          videoId,
+          start: segment.start,
+          end: segment.end,
+          hanzi: segment.hanzi,
+          pinyin: segment.pinyin,
+          vi: segment.vi,
+          order: index + 1,
+        },
+      })),
+    ]);
+    return this.get(videoId);
+  }
+
+  async export(videoId: string) {
+    const video = await this.prisma.video.findUnique({
+      where: { id: videoId },
+      include: { segments: { orderBy: { order: "asc" } } },
+    });
+    if (!video) throw new BadRequestException("Video not found");
+    return this.callWorker("/export/json", {
+      video: {
+        id: video.id,
+        youtubeId: video.youtubeId,
+        title: video.title,
+        titleHanzi: video.titleHanzi,
+        level: video.level,
+        topic: video.topic,
+        channel: video.channel,
+        durationSec: video.durationSec,
+        thumbnailUrl: video.thumbnailUrl,
+        totalSentences: video.segments.length,
+      },
+      segments: video.segments.map((segment) => ({
+        id: segment.order,
+        start: segment.start,
+        end: segment.end,
+        hanzi: segment.hanzi,
+        pinyin: segment.pinyin,
+        vi: segment.vi,
+      })),
+    });
+  }
+
   private async callWorker(path: string, body: Record<string, unknown>): Promise<unknown> {
     let response: Response;
     try {
       response = await fetch(
-        `${process.env.AI_WORKER_URL ?? "http://localhost:8000"}${path}`,
+        `${process.env.AI_WORKER_URL ?? "http://127.0.0.1:8000"}${path}`,
         {
           method: "POST",
           headers: { "content-type": "application/json" },

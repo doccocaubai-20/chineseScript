@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Segment = {
   id: number;
@@ -14,6 +14,7 @@ type Segment = {
 
 type Video = {
   id: string;
+  youtubeId?: string | null;
   title: string;
   channel?: string | null;
   durationSec?: number | null;
@@ -22,6 +23,30 @@ type Video = {
   status?: string;
   segments?: Segment[];
 };
+
+type YouTubePlayer = {
+  seekTo: (seconds: number, allowSeekAhead?: boolean) => void;
+  getCurrentTime: () => number;
+  destroy: () => void;
+};
+
+type YouTubeApi = {
+  Player: new (
+    element: HTMLElement,
+    options: {
+      videoId: string;
+      playerVars?: { modestbranding?: number; rel?: number };
+      events?: { onReady?: () => void };
+    },
+  ) => YouTubePlayer;
+};
+
+declare global {
+  interface Window {
+    YT?: YouTubeApi;
+    onYouTubeIframeAPIReady?: () => void;
+  }
+}
 
 const initialSegments: Segment[] = [
   { id: 1, start: 6.1, end: 10.44, hanzi: "大家好，欢迎来到我的频道。", pinyin: "Dàjiā hǎo, huānyíng láidào wǒ de píndào.", vi: "Xin chào mọi người, chào mừng đến với kênh của tôi." },
@@ -40,8 +65,70 @@ export default function HomePage() {
   const [selectedId, setSelectedId] = useState(1);
   const [video, setVideo] = useState<Video | null>(null);
   const [loading, setLoading] = useState(false);
+  const [activeSegmentId, setActiveSegmentId] = useState(0);
+  const playerRef = useRef<YouTubePlayer | null>(null);
+  const playerElementRef = useRef<HTMLDivElement | null>(null);
   const [notice, setNotice] = useState("Dữ liệu mẫu sẵn sàng để chỉnh sửa.");
   const selected = useMemo(() => segments.find((segment) => segment.id === selectedId), [segments, selectedId]);
+
+  useEffect(() => {
+    if (!video?.youtubeId || !playerElementRef.current) return;
+
+    let cancelled = false;
+    const createPlayer = () => {
+      if (!cancelled && window.YT && playerElementRef.current) {
+        playerRef.current?.destroy();
+        playerRef.current = new window.YT.Player(playerElementRef.current, {
+          videoId: video.youtubeId ?? "",
+          playerVars: { modestbranding: 1, rel: 0 },
+          events: { onReady: () => setNotice("Video đã sẵn sàng.") },
+        });
+      }
+    };
+
+    if (window.YT) {
+      createPlayer();
+    } else {
+      const previousReady = window.onYouTubeIframeAPIReady;
+      window.onYouTubeIframeAPIReady = () => {
+        previousReady?.();
+        createPlayer();
+      };
+      const script = document.querySelector('script[src="https://www.youtube.com/iframe_api"]');
+      if (!script) {
+        const apiScript = document.createElement("script");
+        apiScript.src = "https://www.youtube.com/iframe_api";
+        document.body.appendChild(apiScript);
+      }
+    }
+
+    return () => {
+      cancelled = true;
+      playerRef.current?.destroy();
+      playerRef.current = null;
+    };
+  }, [video?.youtubeId]);
+
+  useEffect(() => {
+    if (!playerRef.current || !segments.length) return;
+    const timer = window.setInterval(() => {
+      const currentTime = playerRef.current?.getCurrentTime() ?? -1;
+      const currentSegment = segments.find(
+        (segment) => currentTime >= segment.start && currentTime < segment.end,
+      );
+      if (currentSegment) {
+        setActiveSegmentId(currentSegment.id);
+        setSelectedId(currentSegment.id);
+      }
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, [segments]);
+
+  function seekToSegment(segment: Segment) {
+    setSelectedId(segment.id);
+    setActiveSegmentId(segment.id);
+    playerRef.current?.seekTo(segment.start, true);
+  }
 
   async function createVideo() {
     if (!url.trim()) {
@@ -62,10 +149,16 @@ export default function HomePage() {
         throw new Error(detail || "Không thể đọc video YouTube.");
       }
       const created = (await response.json()) as Video;
+      const mapped = (created.segments ?? []).map((segment) => ({
+        ...segment,
+        id: segment.order ?? segment.id,
+      }));
       setVideo(created);
-      setSegments([]);
-      setSelectedId(0);
-      setNotice("Đã tạo video. Bấm xử lý để tạo transcript thật.");
+      setSegments(mapped);
+      setSelectedId(mapped[0]?.id ?? 0);
+      setNotice(mapped.length
+        ? `Đã tải lại ${mapped.length} câu transcript từ database.`
+        : "Đã tạo video. Bấm xử lý để tạo transcript thật.");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Không thể kết nối API.");
     } finally {
@@ -92,6 +185,56 @@ export default function HomePage() {
     } finally {
       setLoading(false);
     }
+
+  }
+
+  async function saveDraft() {
+    if (!video) {
+      setNotice(`Đã lưu bản nháp gồm ${segments.length} câu.`);
+      return;
+    }
+    setLoading(true);
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}/segments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ segments }),
+      });
+      if (!response.ok) throw new Error((await response.text()) || "Không thể lưu segments.");
+      setNotice(`Đã lưu ${segments.length} câu vào database.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Không thể lưu bản nháp.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function exportJson() {
+    if (!video) {
+      setNotice("Hãy tạo video trước khi export.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}/export`, { method: "POST" });
+      if (!response.ok) throw new Error((await response.text()) || "Export thất bại.");
+      const payload = await response.json();
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+      const downloadUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = `${video.youtubeId ?? video.id}-learning.json`;
+      link.style.display = "none";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(downloadUrl);
+      setNotice("Đã export JSON.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Không thể export JSON.");
+    } finally {
+      setLoading(false);
+    }
   }
 
   function updateSegment(id: number, field: keyof Segment, value: string) {
@@ -111,10 +254,6 @@ export default function HomePage() {
   function removeSelected() {
     setSegments((current) => current.filter((segment) => segment.id !== selectedId));
     setSelectedId(segments.find((segment) => segment.id !== selectedId)?.id ?? 0);
-  }
-
-  function saveDraft() {
-    setNotice(`Đã lưu bản nháp gồm ${segments.length} câu.`);
   }
 
   return (
@@ -144,6 +283,13 @@ export default function HomePage() {
       )}
 
       <div className="workspace">
+        <section className="panel player-panel">
+          <div className="panel-heading">
+            <div><span className="eyebrow">VIDEO</span><h2>Playback</h2></div>
+            <span className="count">{activeSegmentId ? `Câu ${activeSegmentId}` : "Chưa phát"}</span>
+          </div>
+          {video?.youtubeId ? <div className="player-frame" ref={playerElementRef} /> : <p className="empty">Tạo video YouTube để hiển thị player.</p>}
+        </section>
         <section className="panel transcript-panel">
           <div className="panel-heading">
             <div><span className="eyebrow">TRANSCRIPT</span><h2>Chinese Conversation</h2></div>
@@ -151,7 +297,7 @@ export default function HomePage() {
           </div>
           <div className="segment-list">
             {segments.map((segment) => (
-              <button className={`segment-row ${segment.id === selectedId ? "selected" : ""}`} key={segment.id} onClick={() => setSelectedId(segment.id)}>
+              <button className={`segment-row ${segment.id === selectedId ? "selected" : ""} ${segment.id === activeSegmentId ? "playing" : ""}`} key={segment.id} onClick={() => seekToSegment(segment)}>
                 <span className="segment-number">{String(segment.id).padStart(2, "0")}</span>
                 <span className="segment-content">
                   <strong>{segment.hanzi || "Chưa có Hanzi"}</strong>
@@ -179,7 +325,7 @@ export default function HomePage() {
               <label>Hanzi<textarea rows={3} value={selected.hanzi} onChange={(event) => updateSegment(selected.id, "hanzi", event.target.value)} /></label>
               <label>Pinyin<textarea rows={2} value={selected.pinyin} onChange={(event) => updateSegment(selected.id, "pinyin", event.target.value)} /></label>
               <label>Tiếng Việt<textarea rows={3} value={selected.vi} onChange={(event) => updateSegment(selected.id, "vi", event.target.value)} /></label>
-              <div className="actions"><button className="ghost" onClick={() => setNotice("Validation: bản nháp hợp lệ.")}>Kiểm tra</button><button className="primary" onClick={saveDraft}>Lưu bản nháp</button></div>
+              <div className="actions"><button className="ghost" onClick={exportJson} disabled={loading}>Export JSON</button><button className="primary" onClick={saveDraft} disabled={loading}>Lưu bản nháp</button></div>
             </div>
           ) : <p className="empty">Chọn một câu để bắt đầu chỉnh sửa.</p>}
         </section>

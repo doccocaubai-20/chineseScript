@@ -1,5 +1,5 @@
 import { Body, Controller, Get, Param, Post } from "@nestjs/common";
-import { CreateYouTubeVideoDto, VideosService } from "./videos.service";
+import { CreateYouTubeVideoDto, UpdateSegmentsDto, VideosService } from "./videos.service";
 
 @Controller("videos")
 export class VideosController {
@@ -33,5 +33,15 @@ export class VideosController {
   @Get(":id")
   get(@Param("id") id: string) {
     return this.videosService.get(id);
+  }
+
+  @Post(":id/segments")
+  updateSegments(@Param("id") id: string, @Body() body: UpdateSegmentsDto) {
+    return this.videosService.updateSegments(id, body.segments);
+  }
+
+  @Post(":id/export")
+  export(@Param("id") id: string) {
+    return this.videosService.export(id);
   }
 }
