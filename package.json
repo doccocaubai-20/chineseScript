@@ -1,0 +1,12 @@
+{
+  "name": "chinese-video-learning",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev:web": "corepack pnpm --filter web dev",
+    "dev:api": "corepack pnpm --filter api start:dev",
+    "db:generate": "corepack pnpm --filter api prisma generate",
+    "db:validate": "corepack pnpm --filter api prisma validate",
+    "build": "corepack pnpm -r build"
+  }
+}

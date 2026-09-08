@@ -1,0 +1,102 @@
+# Chinese Video to Learning JSON
+
+Monorepo for converting Chinese videos into timestamped learning segments:
+
+```text
+YouTube/MP4 -> FFmpeg -> faster-whisper -> sentence alignment
+-> Pinyin -> Vietnamese translation -> validation -> JSON
+```
+
+## Workspace
+
+- `apps/web`: Next.js frontend.
+- `apps/api`: NestJS API and Prisma persistence.
+- `services/ai-worker`: Python/FastAPI media and AI processing service.
+- `packages/contracts`: shared TypeScript contract types.
+- `docs`: architecture and JSON export contract.
+
+## Prerequisites
+
+- Node.js 20+
+- pnpm 9+
+- Python 3.10+
+- Docker Desktop
+- FFmpeg available to the AI worker
+
+Phase 4 requires FFmpeg on `PATH`. On Windows, install it with a trusted package
+manager or download the official build, then verify with:
+
+```powershell
+ffmpeg -version
+```
+
+The first transcription with faster-whisper also downloads the configured model
+(`small` by default). The model is cached locally; no transcript is fabricated when
+FFmpeg, the model, or the input media is unavailable.
+
+## Local setup
+
+1. Copy `.env.example` to `.env` and adjust provider settings.
+2. Start infrastructure:
+
+   ```powershell
+   docker compose up -d postgres
+   ```
+
+3. Install TypeScript dependencies:
+
+   ```powershell
+   pnpm install
+   ```
+
+4. Generate the Prisma client and validate the schema:
+
+   ```powershell
+   pnpm db:generate
+   pnpm db:validate
+   ```
+
+5. Start the applications in separate terminals. The API and worker automatically
+   load `.env` from the project root:
+
+   ```powershell
+   pnpm dev:api
+   pnpm dev:web
+   ```
+
+6. Start the worker:
+
+   ```powershell
+   cd services/ai-worker
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   uvicorn app.main:app --reload --port 8000
+   ```
+
+The API health endpoint is `http://localhost:3001/health`; the worker health
+endpoint is `http://localhost:8000/health`; the web app is `http://localhost:3000`.
+
+Detailed local testing steps are in [docs/LOCAL-TESTING.md](docs/LOCAL-TESTING.md).
+
+For a simpler Windows workflow, run `.\scripts\start-local.ps1`. It opens the
+worker, API, and web app in separate PowerShell windows. Run
+`.\scripts\stop-local.ps1` to stop services on ports 8000, 3001, and 3000.
+
+To create a YouTube source through the API, send:
+
+```powershell
+Invoke-RestMethod http://localhost:3001/videos/youtube `
+  -Method Post -ContentType "application/json" `
+  -Body '{"sourceUrl":"https://www.youtube.com/watch?v=VIDEO_ID"}'
+```
+
+The API validates the host, asks the local worker to resolve metadata with `yt-dlp`,
+and persists the source in PostgreSQL. To download temporary audio for an existing
+video, call `POST /api/videos/:id/media`; the returned local path is stored in
+`mediaPath`. The file is temporary and transcription is implemented in later phases.
+
+Phase 2 creates skeletons only. No transcript or timestamp is fabricated; processing
+features are added in later phases. Pinyin is generated locally with `pypinyin`.
+Vietnamese translation uses an OpenAI-compatible provider; DeepSeek is the default
+configuration in `.env.example`.
