@@ -77,6 +77,7 @@ export default function HomePage() {
   const playerRef = useRef<YouTubePlayer | null>(null);
   const playerElementRef = useRef<HTMLDivElement | null>(null);
   const [notice, setNotice] = useState("Dữ liệu mẫu sẵn sàng để chỉnh sửa.");
+  const [transcriptInput, setTranscriptInput] = useState<HTMLInputElement | null>(null);
   const selected = useMemo(() => segments.find((segment) => segment.id === selectedId), [segments, selectedId]);
 
   useEffect(() => {
@@ -193,6 +194,7 @@ export default function HomePage() {
         if (job.status === "FAILED") throw new Error(job.errorMessage || "Pipeline thất bại.");
         if (job.status === "COMPLETED") break;
       }
+
       const processedResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}`);
       if (!processedResponse.ok) throw new Error("Không thể tải kết quả pipeline.");
       const processed = (await processedResponse.json()) as Video;
@@ -207,6 +209,47 @@ export default function HomePage() {
       setLoading(false);
     }
 
+  }
+
+  async function importTranscript(file: File) {
+    if (!video) {
+      setNotice("Hãy tạo video YouTube trước khi import transcript.");
+      return;
+    }
+    setLoading(true);
+    setNotice(`Đang import ${file.name}...`);
+    try {
+      const payload = JSON.parse(await file.text()) as unknown;
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}/transcript-import`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) throw new Error((await response.text()) || "Import transcript thất bại.");
+      await response.json();
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const jobResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}/job`);
+        if (!jobResponse.ok) throw new Error((await jobResponse.text()) || "Không thể đọc trạng thái import.");
+        const job = (await jobResponse.json()) as ProcessingJob | null;
+        if (!job) throw new Error("Không tìm thấy processing job.");
+        setNotice(`Đang import: ${job.currentStep ?? "QUEUED"} (${job.progress}%)`);
+        if (job.status === "FAILED") throw new Error(job.errorMessage || "Import transcript thất bại.");
+        if (job.status === "COMPLETED") break;
+      }
+      const processedResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}`);
+      if (!processedResponse.ok) throw new Error("Không thể tải segments sau import.");
+      const processed = (await processedResponse.json()) as Video;
+      const mapped = (processed.segments ?? []).map((segment) => ({ ...segment, id: segment.order ?? segment.id }));
+      setVideo(processed);
+      setSegments(mapped);
+      setSelectedId(mapped[0]?.id ?? 0);
+      setNotice(`Đã import và tạo ${mapped.length} câu transcript.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Import transcript thất bại.");
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function saveDraft() {
@@ -299,7 +342,21 @@ export default function HomePage() {
         <section className="video-summary">
           {video.thumbnailUrl && <img src={video.thumbnailUrl} alt="" />}
           <div><span className="eyebrow">VIDEO ĐÃ TẠO</span><h2>{video.title}</h2><p>{video.channel || "Không rõ kênh"} · {video.durationSec ? formatTime(video.durationSec) : "Chưa rõ thời lượng"}</p></div>
-          <button className="primary" onClick={processVideo} disabled={loading}>{loading ? "Đang chạy..." : "Chạy pipeline"}</button>
+          <div className="actions">
+            <button className="ghost" onClick={() => transcriptInput?.click()} disabled={!video}>Import transcript.json</button>
+            <button className="primary" onClick={processVideo} disabled={loading}>{loading ? "Đang chạy..." : "Chạy pipeline"}</button>
+            <input
+              ref={setTranscriptInput}
+              type="file"
+              accept="application/json,.json"
+              hidden
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void importTranscript(file);
+                event.target.value = "";
+              }}
+            />
+          </div>
         </section>
       )}
 

@@ -1,9 +1,8 @@
-import {
+﻿import {
   BadRequestException,
   Injectable,
   ServiceUnavailableException,
 } from "@nestjs/common";
-import { readFile } from "node:fs/promises";
 import { Prisma, VideoSourceType } from "@prisma/client";
 import { IsArray, IsUrl } from "class-validator";
 import { PrismaService } from "./prisma.service";
@@ -58,6 +57,11 @@ interface SegmentResult {
   hanzi: string;
   pinyin: string;
   vi: string;
+}
+
+interface ImportedTranscript extends TranscriptionResult {
+  language: string;
+  chunks: TranscriptionResult["chunks"];
 }
 
 export class UpdateSegmentsDto {
@@ -197,8 +201,15 @@ export class VideosService {
       where: { videoId },
       orderBy: { createdAt: "desc" },
     });
-    if (latestJob?.status === "QUEUED" || latestJob?.status === "RUNNING") {
+    if (latestJob && this.isActiveJob(latestJob)) {
       return latestJob;
+    }
+    if (latestJob?.status === "QUEUED" || latestJob?.status === "RUNNING") {
+      await this.updateJob(latestJob.id, {
+        status: "FAILED",
+        errorMessage: "Job was marked stale before restarting processing",
+        finishedAt: new Date(),
+      });
     }
 
     const job = await this.prisma.processingJob.create({
@@ -211,53 +222,109 @@ export class VideosService {
     return job;
   }
 
+  async importTranscript(videoId: string, payload: unknown) {
+    const video = await this.prisma.video.findUnique({ where: { id: videoId } });
+    if (!video?.sourceUrl) {
+      throw new BadRequestException("Video does not have a source URL");
+    }
+    const transcript = this.validateImportedTranscript(payload);
+    const latestJob = await this.prisma.processingJob.findFirst({
+      where: { videoId },
+      orderBy: { createdAt: "desc" },
+    });
+    if (latestJob?.status === "QUEUED" || latestJob?.status === "RUNNING") {
+      await this.updateJob(latestJob.id, {
+        status: "FAILED",
+        errorMessage: "Job was marked stale before a new transcript import",
+        finishedAt: new Date(),
+      });
+    }
+    const job = await this.prisma.processingJob.create({
+      data: {
+        videoId,
+        checkpoint: { transcript } as unknown as Prisma.InputJsonValue,
+      },
+    });
+    void this.runProcess(videoId, job.id, { transcript });
+    return job;
+  }
+
+  private isActiveJob(job: { status: string; createdAt: Date; startedAt: Date | null }): boolean {
+    if (job.status !== "QUEUED" && job.status !== "RUNNING") return false;
+    const timestamp = job.startedAt ?? job.createdAt;
+    const staleAfterMs = Number(process.env.PROCESSING_JOB_STALE_MS ?? 7200000);
+    return Date.now() - timestamp.getTime() < staleAfterMs;
+  }
+
+  private async ensureJobIsCurrent(jobId: string): Promise<void> {
+    const job = await this.prisma.processingJob.findUnique({
+      where: { id: jobId },
+      select: { status: true },
+    });
+    if (!job || job.status !== "RUNNING") {
+      throw new BadRequestException("Processing job was superseded");
+    }
+  }
+
   private async runProcess(videoId: string, jobId: string, initialCheckpoint: PipelineCheckpoint) {
     let checkpoint = initialCheckpoint;
     try {
       const video = await this.prisma.video.findUnique({ where: { id: videoId } });
       if (!video?.sourceUrl) throw new BadRequestException("Video does not have a source URL");
-      await this.updateJob(jobId, { status: "RUNNING", currentStep: "DOWNLOADING", progress: 5 });
+      await this.updateJob(jobId, {
+        status: "RUNNING",
+        currentStep: checkpoint.transcript ? "ALIGNING" : "DOWNLOADING",
+        progress: checkpoint.transcript ? 55 : 5,
+      });
       await this.prisma.video.update({ where: { id: videoId }, data: { status: "PROCESSING" } });
 
-      if (!checkpoint.mediaPath) {
+      if (!checkpoint.transcript && !checkpoint.mediaPath) {
         const downloaded = (await this.callWorker("/youtube/download", {
           source_url: video.sourceUrl,
           output_directory: process.env.MEDIA_ROOT ?? "./media/downloads",
         })) as YouTubeDownload;
+        await this.ensureJobIsCurrent(jobId);
         checkpoint = { ...checkpoint, mediaPath: downloaded.media_path };
         await this.prisma.video.update({ where: { id: videoId }, data: { mediaPath: downloaded.media_path } });
         await this.updateJob(jobId, { checkpoint, currentStep: "EXTRACTING_AUDIO", progress: 20 });
       }
 
-      if (!checkpoint.audioPath) {
+      if (!checkpoint.transcript && !checkpoint.audioPath) {
         const extracted = (await this.callWorker("/media/extract-audio", {
           media_path: checkpoint.mediaPath,
           output_directory: process.env.MEDIA_ROOT ?? "./media/audio",
         })) as AudioExtraction;
+        await this.ensureJobIsCurrent(jobId);
         checkpoint = { ...checkpoint, audioPath: extracted.audio_path };
         await this.updateJob(jobId, { checkpoint, currentStep: "TRANSCRIBING", progress: 35 });
       }
 
       if (!checkpoint.transcript) {
-        const transcript = await this.transcribeAudio(checkpoint.audioPath!);
+        const transcript = (await this.callWorker("/transcribe", {
+          audio_path: checkpoint.audioPath,
+        })) as TranscriptionResult;
+        await this.ensureJobIsCurrent(jobId);
         checkpoint = { ...checkpoint, transcript };
         await this.updateJob(jobId, { checkpoint, currentStep: "ALIGNING", progress: 55 });
       }
 
       if (!checkpoint.aligned) {
         const aligned = (await this.callWorker("/align", { chunks: checkpoint.transcript?.chunks ?? [] })) as { segments: SegmentResult[] };
+        await this.ensureJobIsCurrent(jobId);
         checkpoint = { ...checkpoint, aligned };
         await this.updateJob(jobId, { checkpoint, currentStep: "GENERATING_PINYIN", progress: 65 });
       }
 
       if (!checkpoint.withPinyin) {
         const withPinyin = (await this.callWorker("/pinyin", { segments: checkpoint.aligned?.segments ?? [] })) as { segments: SegmentResult[] };
+        await this.ensureJobIsCurrent(jobId);
         checkpoint = { ...checkpoint, withPinyin };
         await this.updateJob(jobId, { checkpoint, currentStep: "TRANSLATING", progress: 75 });
       }
 
       if (!checkpoint.translated) {
         const translated = (await this.callWorker("/translate", { segments: checkpoint.withPinyin?.segments ?? [] })) as { segments: SegmentResult[] };
+        await this.ensureJobIsCurrent(jobId);
         checkpoint = { ...checkpoint, translated };
         await this.updateJob(jobId, { checkpoint, currentStep: "VALIDATING", progress: 90 });
       }
@@ -311,6 +378,47 @@ export class VideosService {
       where: { videoId },
       orderBy: { createdAt: "desc" },
     });
+  }
+
+  private validateImportedTranscript(payload: unknown): ImportedTranscript {
+    if (!payload || typeof payload !== "object") {
+      throw new BadRequestException("Transcript JSON must be an object");
+    }
+    const candidate = payload as { chunks?: unknown; language?: unknown; audio_path?: unknown };
+    if (!Array.isArray(candidate.chunks) || candidate.chunks.length === 0) {
+      throw new BadRequestException("Transcript JSON must contain a non-empty chunks array");
+    }
+    const chunks = candidate.chunks.map((chunk, index) => {
+      if (!chunk || typeof chunk !== "object") {
+        throw new BadRequestException(`Invalid transcript chunk at index ${index}`);
+      }
+      const item = chunk as Record<string, unknown>;
+      const start = Number(item.start);
+      const end = Number(item.end);
+      const text = String(item.text ?? "").trim();
+      const words = Array.isArray(item.words) ? item.words : [];
+      if (!text || !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) {
+        throw new BadRequestException(`Invalid transcript chunk at index ${index}`);
+      }
+      return {
+        text,
+        start,
+        end,
+        words: words.map((word) => {
+          const value = word as Record<string, unknown>;
+          return {
+            text: String(value.text ?? ""),
+            start: Number(value.start),
+            end: Number(value.end),
+          };
+        }),
+      };
+    });
+    return {
+      audio_path: typeof candidate.audio_path === "string" ? candidate.audio_path : "imported-transcript",
+      language: typeof candidate.language === "string" ? candidate.language : "zh",
+      chunks,
+    };
   }
 
   async updateSegments(videoId: string, segments: SegmentResult[]) {
@@ -444,45 +552,4 @@ export class VideosService {
     );
   }
 
-  private async transcribeAudio(audioPath: string): Promise<TranscriptionResult> {
-    const remoteUrl = process.env.REMOTE_TRANSCRIBE_URL?.trim();
-    if (!remoteUrl) {
-      return (await this.callWorker("/transcribe", { audio_path: audioPath })) as TranscriptionResult;
-    }
-
-    const audio = await readFile(audioPath);
-    const form = new FormData();
-    form.append("file", new Blob([audio], { type: "audio/wav" }), "audio.wav");
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      Number(process.env.AI_WORKER_TIMEOUT_MS ?? 1800000),
-    );
-    try {
-      const response = await fetch(remoteUrl, {
-        method: "POST", 
-        body: form,
-        headers: {
-          "ngrok-skip-browser-warning": "true",
-          ...(process.env.REMOTE_TRANSCRIBE_TOKEN
-            ? { authorization: `Bearer ${process.env.REMOTE_TRANSCRIBE_TOKEN}` }
-            : {}),
-        },
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new ServiceUnavailableException(
-          (await response.text()) || "Remote transcription failed",
-        );
-      }
-      return (await response.json()) as TranscriptionResult;
-    } catch (error) {
-      if (error instanceof ServiceUnavailableException) throw error;
-      throw new ServiceUnavailableException(
-        `Remote transcription is unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
 }

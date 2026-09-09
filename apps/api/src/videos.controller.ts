@@ -30,6 +30,11 @@ export class VideosController {
     return this.videosService.process(id);
   }
 
+  @Post(":id/transcript-import")
+  importTranscript(@Param("id") id: string, @Body() body: unknown) {
+    return this.videosService.importTranscript(id, body);
+  }
+
   @Get(":id/job")
   getJob(@Param("id") id: string) {
     return this.videosService.getJob(id);

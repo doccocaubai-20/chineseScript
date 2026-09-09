@@ -18,15 +18,22 @@ def _parse_json_content(content: str) -> list[dict]:
 
 
 def translate_segments(segments: list[dict]) -> list[dict]:
+    if not segments:
+        return []
+    batch_size = max(1, int(os.getenv("TRANSLATION_BATCH_SIZE", "8")))
+    translated: list[dict] = []
+    for start in range(0, len(segments), batch_size):
+        translated.extend(_translate_batch(segments[start : start + batch_size]))
+    return translated
+
+
+def _translate_batch(segments: list[dict]) -> list[dict]:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise TranslationProviderError("OPENAI_API_KEY is not configured")
     model = os.getenv("TRANSLATION_MODEL", "").strip()
     if not model:
         raise TranslationProviderError("TRANSLATION_MODEL is not configured")
-    if not segments:
-        return []
-
     payload_segments = [
         {"id": segment.get("id"), "hanzi": str(segment.get("hanzi", ""))}
         for segment in segments
@@ -66,8 +73,18 @@ def translate_segments(segments: list[dict]) -> list[dict]:
     try:
         with request.urlopen(client_request, timeout=120) as response:
             response_body = json.loads(response.read().decode("utf-8"))
-    except (error.HTTPError, error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+    except error.HTTPError as exc:
+        provider_body = exc.read().decode("utf-8", errors="replace").strip()
+        if len(provider_body) > 500:
+            provider_body = provider_body[:500] + "..."
+        detail = provider_body or str(exc.reason)
+        raise TranslationProviderError(
+            f"Translation provider returned HTTP {exc.code}: {detail}"
+        ) from exc
+    except (error.URLError, TimeoutError) as exc:
         raise TranslationProviderError(f"Translation provider request failed: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise TranslationProviderError("Translation provider returned invalid JSON") from exc
 
     try:
         content = response_body["choices"][0]["message"]["content"]
