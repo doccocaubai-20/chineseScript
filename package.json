@@ -5,8 +5,11 @@
   "scripts": {
     "dev:web": "corepack pnpm --filter web dev",
     "dev:api": "corepack pnpm --filter api start:dev",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose stop postgres",
     "db:generate": "corepack pnpm --filter api prisma generate",
     "db:validate": "corepack pnpm --filter api prisma validate",
+    "db:migrate": "corepack pnpm --filter api prisma migrate deploy",
     "build": "corepack pnpm -r build"
   }
 }

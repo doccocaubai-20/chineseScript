@@ -3,7 +3,7 @@ import {
   Injectable,
   ServiceUnavailableException,
 } from "@nestjs/common";
-import { VideoSourceType } from "@prisma/client";
+import { Prisma, VideoSourceType } from "@prisma/client";
 import { IsArray, IsUrl } from "class-validator";
 import { PrismaService } from "./prisma.service";
 
@@ -39,6 +39,15 @@ interface TranscriptionResult {
     end: number;
     words: Array<{ text: string; start: number; end: number }>;
   }>;
+}
+
+interface PipelineCheckpoint {
+  mediaPath?: string;
+  audioPath?: string;
+  transcript?: TranscriptionResult;
+  aligned?: { segments: SegmentResult[] };
+  withPinyin?: { segments: SegmentResult[] };
+  translated?: { segments: SegmentResult[] };
 }
 
 interface SegmentResult {
@@ -183,28 +192,80 @@ export class VideosService {
       throw new BadRequestException("Video does not have a source URL");
     }
 
-    await this.prisma.video.update({ where: { id: videoId }, data: { status: "PROCESSING" } });
-    try {
-      const downloaded = (await this.callWorker("/youtube/download", {
-        source_url: video.sourceUrl,
-        output_directory: process.env.MEDIA_ROOT ?? "./media/downloads",
-      })) as YouTubeDownload;
-      await this.prisma.video.update({ where: { id: videoId }, data: { mediaPath: downloaded.media_path } });
+    const latestJob = await this.prisma.processingJob.findFirst({
+      where: { videoId },
+      orderBy: { createdAt: "desc" },
+    });
+    if (latestJob?.status === "QUEUED" || latestJob?.status === "RUNNING") {
+      return latestJob;
+    }
 
-      const extracted = (await this.callWorker("/media/extract-audio", {
-        media_path: downloaded.media_path,
-        output_directory: process.env.MEDIA_ROOT ?? "./media/audio",
-      })) as AudioExtraction;
-      const transcript = (await this.callWorker("/transcribe", {
-        audio_path: extracted.audio_path,
-      })) as TranscriptionResult;
-      const aligned = (await this.callWorker("/align", { chunks: transcript.chunks })) as { segments: SegmentResult[] };
-      const withPinyin = (await this.callWorker("/pinyin", { segments: aligned.segments })) as { segments: SegmentResult[] };
-      const translated = (await this.callWorker("/translate", { segments: withPinyin.segments })) as { segments: SegmentResult[] };
+    const job = await this.prisma.processingJob.create({
+      data: {
+        videoId,
+        checkpoint: latestJob?.checkpoint ?? undefined,
+      },
+    });
+    void this.runProcess(videoId, job.id, (latestJob?.checkpoint as PipelineCheckpoint | null) ?? {});
+    return job;
+  }
+
+  private async runProcess(videoId: string, jobId: string, initialCheckpoint: PipelineCheckpoint) {
+    let checkpoint = initialCheckpoint;
+    try {
+      const video = await this.prisma.video.findUnique({ where: { id: videoId } });
+      if (!video?.sourceUrl) throw new BadRequestException("Video does not have a source URL");
+      await this.updateJob(jobId, { status: "RUNNING", currentStep: "DOWNLOADING", progress: 5 });
+      await this.prisma.video.update({ where: { id: videoId }, data: { status: "PROCESSING" } });
+
+      if (!checkpoint.mediaPath) {
+        const downloaded = (await this.callWorker("/youtube/download", {
+          source_url: video.sourceUrl,
+          output_directory: process.env.MEDIA_ROOT ?? "./media/downloads",
+        })) as YouTubeDownload;
+        checkpoint = { ...checkpoint, mediaPath: downloaded.media_path };
+        await this.prisma.video.update({ where: { id: videoId }, data: { mediaPath: downloaded.media_path } });
+        await this.updateJob(jobId, { checkpoint, currentStep: "EXTRACTING_AUDIO", progress: 20 });
+      }
+
+      if (!checkpoint.audioPath) {
+        const extracted = (await this.callWorker("/media/extract-audio", {
+          media_path: checkpoint.mediaPath,
+          output_directory: process.env.MEDIA_ROOT ?? "./media/audio",
+        })) as AudioExtraction;
+        checkpoint = { ...checkpoint, audioPath: extracted.audio_path };
+        await this.updateJob(jobId, { checkpoint, currentStep: "TRANSCRIBING", progress: 35 });
+      }
+
+      if (!checkpoint.transcript) {
+        const transcript = (await this.callWorker("/transcribe", {
+          audio_path: checkpoint.audioPath,
+        })) as TranscriptionResult;
+        checkpoint = { ...checkpoint, transcript };
+        await this.updateJob(jobId, { checkpoint, currentStep: "ALIGNING", progress: 55 });
+      }
+
+      if (!checkpoint.aligned) {
+        const aligned = (await this.callWorker("/align", { chunks: checkpoint.transcript?.chunks ?? [] })) as { segments: SegmentResult[] };
+        checkpoint = { ...checkpoint, aligned };
+        await this.updateJob(jobId, { checkpoint, currentStep: "GENERATING_PINYIN", progress: 65 });
+      }
+
+      if (!checkpoint.withPinyin) {
+        const withPinyin = (await this.callWorker("/pinyin", { segments: checkpoint.aligned?.segments ?? [] })) as { segments: SegmentResult[] };
+        checkpoint = { ...checkpoint, withPinyin };
+        await this.updateJob(jobId, { checkpoint, currentStep: "TRANSLATING", progress: 75 });
+      }
+
+      if (!checkpoint.translated) {
+        const translated = (await this.callWorker("/translate", { segments: checkpoint.withPinyin?.segments ?? [] })) as { segments: SegmentResult[] };
+        checkpoint = { ...checkpoint, translated };
+        await this.updateJob(jobId, { checkpoint, currentStep: "VALIDATING", progress: 90 });
+      }
 
       await this.prisma.$transaction([
         this.prisma.segment.deleteMany({ where: { videoId } }),
-        ...translated.segments.map((segment) =>
+        ...(checkpoint.translated?.segments ?? []).map((segment) =>
           this.prisma.segment.create({
             data: {
               videoId,
@@ -219,9 +280,22 @@ export class VideosService {
         ),
         this.prisma.video.update({ where: { id: videoId }, data: { status: "COMPLETED" } }),
       ]);
+      await this.updateJob(jobId, {
+        status: "COMPLETED",
+        currentStep: "COMPLETED",
+        progress: 100,
+        checkpoint,
+        finishedAt: new Date(),
+      });
       return this.get(videoId);
     } catch (error) {
       await this.prisma.video.update({ where: { id: videoId }, data: { status: "FAILED" } });
+      await this.updateJob(jobId, {
+        status: "FAILED",
+        errorMessage: error instanceof Error ? error.message : "Pipeline failed",
+        checkpoint,
+        finishedAt: new Date(),
+      });
       throw error;
     }
   }
@@ -230,6 +304,13 @@ export class VideosService {
     return this.prisma.video.findUnique({
       where: { id: videoId },
       include: { segments: { orderBy: { order: "asc" } } },
+    });
+  }
+
+  async getJob(videoId: string) {
+    return this.prisma.processingJob.findFirst({
+      where: { videoId },
+      orderBy: { createdAt: "desc" },
     });
   }
 
@@ -306,25 +387,61 @@ export class VideosService {
     });
   }
 
+  private async updateJob(
+    jobId: string,
+    data: {
+      status?: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED";
+      currentStep?: string;
+      progress?: number;
+      errorMessage?: string;
+      finishedAt?: Date;
+      checkpoint?: PipelineCheckpoint;
+    },
+  ) {
+    return this.prisma.processingJob.update({
+      where: { id: jobId },
+      data: {
+        ...data,
+        checkpoint: data.checkpoint as Prisma.InputJsonValue | undefined,
+      },
+    });
+  }
+
   private async callWorker(path: string, body: Record<string, unknown>): Promise<unknown> {
-    let response: Response;
-    try {
-      response = await fetch(
-        `${process.env.AI_WORKER_URL ?? "http://127.0.0.1:8000"}${path}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-        },
-      );
-    } catch (error) {
-      throw new ServiceUnavailableException(
-        `AI worker is unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
-      );
+    let lastError: unknown;
+    const timeoutMs = Number(process.env.AI_WORKER_TIMEOUT_MS ?? 1800000);
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        let response: Response;
+        try {
+          response = await fetch(
+            `${process.env.AI_WORKER_URL ?? "http://127.0.0.1:8000"}${path}`,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(body),
+              signal: controller.signal,
+            },
+          );
+        } finally {
+          clearTimeout(timeout);
+        }
+        if (response.ok) return response.json();
+        const detail = (await response.text()) || "Worker request failed";
+        if (response.status < 500 && response.status !== 408 && response.status !== 429) {
+          throw new BadRequestException(detail);
+        }
+        lastError = new Error(detail);
+      } catch (error) {
+        if (error instanceof BadRequestException) throw error;
+        lastError = error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
     }
-    if (!response.ok) {
-      throw new BadRequestException((await response.text()) || "Worker request failed");
-    }
-    return response.json();
+    throw new ServiceUnavailableException(
+      `AI worker is unavailable: ${lastError instanceof Error ? lastError.message : "unknown error"}`,
+    );
   }
 }

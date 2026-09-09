@@ -8,3 +8,4 @@ foreach ($port in $ports) {
 }
 
 Write-Host "Stopped local services listening on ports 8000, 3001, and 3000."
+docker compose stop postgres

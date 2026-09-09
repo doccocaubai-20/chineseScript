@@ -30,6 +30,11 @@ export class VideosController {
     return this.videosService.process(id);
   }
 
+  @Get(":id/job")
+  getJob(@Param("id") id: string) {
+    return this.videosService.getJob(id);
+  }
+
   @Get(":id")
   get(@Param("id") id: string) {
     return this.videosService.get(id);

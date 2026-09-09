@@ -24,6 +24,14 @@ type Video = {
   segments?: Segment[];
 };
 
+type ProcessingJob = {
+  id: string;
+  status: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED";
+  currentStep?: string | null;
+  progress: number;
+  errorMessage?: string | null;
+};
+
 type YouTubePlayer = {
   seekTo: (seconds: number, allowSeekAhead?: boolean) => void;
   getCurrentTime: () => number;
@@ -170,11 +178,24 @@ export default function HomePage() {
   async function processVideo() {
     if (!video) return;
     setLoading(true);
-    setNotice("Đang tải media và chạy pipeline AI. Có thể mất vài phút...");
+    setNotice("Đã xếp hàng pipeline AI...");
     try {
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}/process`, { method: "POST" });
       if (!response.ok) throw new Error((await response.text()) || "Pipeline thất bại.");
-      const processed = (await response.json()) as Video;
+      await response.json();
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const jobResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}/job`);
+        if (!jobResponse.ok) throw new Error((await jobResponse.text()) || "Không thể đọc trạng thái pipeline.");
+        const job = (await jobResponse.json()) as ProcessingJob | null;
+        if (!job) throw new Error("Không tìm thấy processing job.");
+        setNotice(`Đang xử lý: ${job.currentStep ?? "QUEUED"} (${job.progress}%)`);
+        if (job.status === "FAILED") throw new Error(job.errorMessage || "Pipeline thất bại.");
+        if (job.status === "COMPLETED") break;
+      }
+      const processedResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}`);
+      if (!processedResponse.ok) throw new Error("Không thể tải kết quả pipeline.");
+      const processed = (await processedResponse.json()) as Video;
       const mapped = (processed.segments ?? []).map((segment) => ({ ...segment, id: segment.order ?? segment.id }));
       setVideo(processed);
       setSegments(mapped);

@@ -3,7 +3,7 @@
 Monorepo for converting Chinese videos into timestamped learning segments:
 
 ```text
-YouTube/MP4 -> FFmpeg -> faster-whisper -> sentence alignment
+YouTube audio -> FFmpeg -> faster-whisper -> sentence alignment
 -> Pinyin -> Vietnamese translation -> validation -> JSON
 ```
 
@@ -36,11 +36,19 @@ FFmpeg, the model, or the input media is unavailable.
 
 ## Local setup
 
-1. Copy `.env.example` to `.env` and adjust provider settings.
+1. Copy `.env.example` to `.env`. The default database is local PostgreSQL:
+
+   ```env
+   DATABASE_URL=postgresql://app:app@localhost:55432/chinese_video
+   ```
+
+   If `.env` previously contained Supabase settings, run
+   `.\scripts\use-local-db.ps1` to update it automatically.
+
 2. Start infrastructure:
 
    ```powershell
-   docker compose up -d postgres
+   pnpm db:up
    ```
 
 3. Install TypeScript dependencies:
@@ -56,7 +64,13 @@ FFmpeg, the model, or the input media is unavailable.
    pnpm db:validate
    ```
 
-5. Start the applications in separate terminals. The API and worker automatically
+5. Apply database migrations:
+
+   ```powershell
+   pnpm db:migrate
+   ```
+
+6. Start the applications in separate terminals. The API and worker automatically
    load `.env` from the project root:
 
    ```powershell
@@ -64,7 +78,7 @@ FFmpeg, the model, or the input media is unavailable.
    pnpm dev:web
    ```
 
-6. Start the worker:
+7. Start the worker:
 
    ```powershell
    cd services/ai-worker
@@ -77,11 +91,20 @@ FFmpeg, the model, or the input media is unavailable.
 The API health endpoint is `http://localhost:3001/health`; the worker health
 endpoint is `http://localhost:8000/health`; the web app is `http://localhost:3000`.
 
+Processing runs as a background job. The process endpoint returns immediately;
+the web app polls the job status and displays the current step and progress.
+Completed pipeline stages are saved as checkpoints, so retrying a failed job
+reuses downloaded media, transcripts, Pinyin, and translations when available.
+Normalized WAV audio is transcribed in chunks controlled by
+`AUDIO_CHUNK_DURATION_SEC` (600 seconds by default), with timestamps offset back
+to the original audio timeline.
+
 Detailed local testing steps are in [docs/LOCAL-TESTING.md](docs/LOCAL-TESTING.md).
 
-For a simpler Windows workflow, run `.\scripts\start-local.ps1`. It opens the
-worker, API, and web app in separate PowerShell windows. Run
-`.\scripts\stop-local.ps1` to stop services on ports 8000, 3001, and 3000.
+For a simpler Windows workflow, run `.\scripts\start-local.ps1`. It starts the local
+PostgreSQL container and opens the worker, API, and web app in separate PowerShell
+windows. Run `.\scripts\stop-local.ps1` to stop the applications and PostgreSQL
+container. The database volume is preserved.
 
 To create a YouTube source through the API, send:
 
@@ -92,9 +115,9 @@ Invoke-RestMethod http://localhost:3001/videos/youtube `
 ```
 
 The API validates the host, asks the local worker to resolve metadata with `yt-dlp`,
-and persists the source in PostgreSQL. To download temporary audio for an existing
-video, call `POST /api/videos/:id/media`; the returned local path is stored in
-`mediaPath`. The file is temporary and transcription is implemented in later phases.
+and persists the source in local PostgreSQL. Processing downloads only the best available
+audio stream; the YouTube video itself is embedded in the web player. FFmpeg then
+normalizes that temporary audio for Whisper.
 
 Phase 2 creates skeletons only. No transcript or timestamp is fabricated; processing
 features are added in later phases. Pinyin is generated locally with `pypinyin`.

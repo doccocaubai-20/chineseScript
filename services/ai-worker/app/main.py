@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 
 from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
@@ -80,8 +81,14 @@ def youtube_download(request: YouTubeDownloadRequest) -> dict[str, str]:
                 "quiet": True,
                 "no_warnings": True,
                 "noplaylist": True,
-                "format": "bestaudio/best",
-                "outtmpl": str(output_directory / "%(id)s.%(ext)s"),
+                "socket_timeout": 60,
+                "retries": 5,
+                "fragment_retries": 5,
+                "file_access_retries": 3,
+                "concurrent_fragment_downloads": 1,
+                # Download only the audio stream; the web player embeds YouTube separately.
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "outtmpl": str(output_directory / "%(id)s.audio.%(ext)s"),
             }
         ) as ydl:
             info = ydl.extract_info(str(request.source_url), download=True)
@@ -91,6 +98,11 @@ def youtube_download(request: YouTubeDownloadRequest) -> dict[str, str]:
 
     if not downloaded_path.is_file():
         raise HTTPException(status_code=500, detail="yt-dlp completed without creating a media file")
+
+    max_size_mb = float(os.getenv("MAX_VIDEO_SIZE_MB", "256"))
+    if downloaded_path.stat().st_size > max_size_mb * 1024 * 1024:
+        downloaded_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail=f"Downloaded audio exceeds {max_size_mb:g} MB")
 
     return {"youtube_id": str(info["id"]), "media_path": str(downloaded_path)}
 

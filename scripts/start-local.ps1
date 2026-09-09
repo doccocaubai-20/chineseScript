@@ -1,6 +1,20 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+Push-Location $projectRoot
+try {
+  docker compose up -d postgres
+  if ($LASTEXITCODE -ne 0) {
+    throw "Could not start the local PostgreSQL container."
+  }
+  corepack pnpm db:migrate
+  if ($LASTEXITCODE -ne 0) {
+    throw "Could not apply PostgreSQL migrations."
+  }
+} finally {
+  Pop-Location
+}
+
 $ffmpegPath = Get-ChildItem -Path "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter "ffmpeg.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty DirectoryName
 if ($ffmpegPath) {
   $env:Path = "$ffmpegPath;$env:Path"

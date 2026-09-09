@@ -6,7 +6,7 @@ Tài liệu này dùng cho MVP local-first hiện tại:
 Python AI Worker :8000
 NestJS API       :3001
 Next.js Web      :3000
-Supabase         PostgreSQL
+Docker PostgreSQL
 ```
 
 ## 1. Chuẩn bị
@@ -36,7 +36,7 @@ Tạo file:
 C:\path\to\chinese-video-to-learning-json\.env
 ```
 
-Không commit file này và không chia sẻ password Supabase.
+Không commit file này. Database mặc định chạy trong Docker local.
 
 Nội dung tối thiểu:
 
@@ -44,7 +44,7 @@ Nội dung tối thiểu:
 NODE_ENV=development
 API_PORT=3001
 WEB_PORT=3000
-DATABASE_URL=postgresql://USER:PASSWORD@db.YOUR_PROJECT.supabase.co:5432/postgres?sslmode=require
+DATABASE_URL=postgresql://app:app@localhost:55432/chinese_video
 AI_WORKER_URL=http://localhost:8000
 MEDIA_ROOT=.\media
 WHISPER_MODEL=small
@@ -65,7 +65,8 @@ Chạy một lần:
 corepack pnpm install
 python -m pip install -r services\ai-worker\requirements.txt
 corepack pnpm db:generate
-corepack pnpm --filter api prisma migrate deploy
+corepack pnpm db:up
+corepack pnpm db:migrate
 ```
 
 ## 4. Terminal 1 - chạy AI Worker
@@ -384,7 +385,7 @@ Ctrl+C
 ```
 
 Không cần Redis cho MVP hiện tại. Video/audio chỉ là file tạm local; transcript và
-metadata mới là dữ liệu lưu trong Supabase.
+metadata được lưu trong PostgreSQL local.
 
 ## 16. Lỗi thường gặp
 
@@ -420,7 +421,11 @@ Chạy:
 python -m pip install -r services\ai-worker\requirements.txt
 ```
 
-### Supabase không kết nối được
+### PostgreSQL local không kết nối được
 
-Kiểm tra connection string, password mới, `?sslmode=require`, và URL-encode các ký
-tự đặc biệt trong password.
+Kiểm tra Docker Desktop đang chạy, sau đó khởi động lại database:
+
+```powershell
+corepack pnpm db:up
+corepack pnpm db:migrate
+```
