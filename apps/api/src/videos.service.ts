@@ -460,11 +460,14 @@ export class VideosService {
     );
     try {
       const response = await fetch(remoteUrl, {
-        method: "POST",
+        method: "POST", 
         body: form,
-        headers: process.env.REMOTE_TRANSCRIBE_TOKEN
-          ? { authorization: `Bearer ${process.env.REMOTE_TRANSCRIBE_TOKEN}` }
-          : undefined,
+        headers: {
+          "ngrok-skip-browser-warning": "true",
+          ...(process.env.REMOTE_TRANSCRIBE_TOKEN
+            ? { authorization: `Bearer ${process.env.REMOTE_TRANSCRIBE_TOKEN}` }
+            : {}),
+        },
         signal: controller.signal,
       });
       if (!response.ok) {
