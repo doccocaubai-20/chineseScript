@@ -3,6 +3,7 @@ import {
   Injectable,
   ServiceUnavailableException,
 } from "@nestjs/common";
+import { readFile } from "node:fs/promises";
 import { Prisma, VideoSourceType } from "@prisma/client";
 import { IsArray, IsUrl } from "class-validator";
 import { PrismaService } from "./prisma.service";
@@ -238,9 +239,7 @@ export class VideosService {
       }
 
       if (!checkpoint.transcript) {
-        const transcript = (await this.callWorker("/transcribe", {
-          audio_path: checkpoint.audioPath,
-        })) as TranscriptionResult;
+        const transcript = await this.transcribeAudio(checkpoint.audioPath!);
         checkpoint = { ...checkpoint, transcript };
         await this.updateJob(jobId, { checkpoint, currentStep: "ALIGNING", progress: 55 });
       }
@@ -443,5 +442,44 @@ export class VideosService {
     throw new ServiceUnavailableException(
       `AI worker is unavailable: ${lastError instanceof Error ? lastError.message : "unknown error"}`,
     );
+  }
+
+  private async transcribeAudio(audioPath: string): Promise<TranscriptionResult> {
+    const remoteUrl = process.env.REMOTE_TRANSCRIBE_URL?.trim();
+    if (!remoteUrl) {
+      return (await this.callWorker("/transcribe", { audio_path: audioPath })) as TranscriptionResult;
+    }
+
+    const audio = await readFile(audioPath);
+    const form = new FormData();
+    form.append("file", new Blob([audio], { type: "audio/wav" }), "audio.wav");
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      Number(process.env.AI_WORKER_TIMEOUT_MS ?? 1800000),
+    );
+    try {
+      const response = await fetch(remoteUrl, {
+        method: "POST",
+        body: form,
+        headers: process.env.REMOTE_TRANSCRIBE_TOKEN
+          ? { authorization: `Bearer ${process.env.REMOTE_TRANSCRIBE_TOKEN}` }
+          : undefined,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new ServiceUnavailableException(
+          (await response.text()) || "Remote transcription failed",
+        );
+      }
+      return (await response.json()) as TranscriptionResult;
+    } catch (error) {
+      if (error instanceof ServiceUnavailableException) throw error;
+      throw new ServiceUnavailableException(
+        `Remote transcription is unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }
