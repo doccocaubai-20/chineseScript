@@ -9,6 +9,7 @@ datasource db {
 
 enum VideoSourceType {
   YOUTUBE
+  TIKTOK
   UPLOAD
 }
 

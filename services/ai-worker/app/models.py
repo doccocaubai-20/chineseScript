@@ -37,6 +37,7 @@ class YouTubeMetadataRequest(BaseModel):
 class YouTubeDownloadRequest(BaseModel):
     source_url: HttpUrl
     output_directory: str
+    source_type: str = "YOUTUBE"
 
 
 class AudioExtractionRequest(BaseModel):

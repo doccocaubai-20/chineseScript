@@ -1,6 +1,7 @@
 ﻿import {
   BadRequestException,
   Injectable,
+  OnModuleInit,
   ServiceUnavailableException,
 } from "@nestjs/common";
 import { Prisma, VideoSourceType } from "@prisma/client";
@@ -69,24 +70,43 @@ export class UpdateSegmentsDto {
   segments!: SegmentResult[];
 }
 
-function isYouTubeUrl(sourceUrl: string): boolean {
+function getSourceType(sourceUrl: string): VideoSourceType | null {
   try {
-    const url = new URL(sourceUrl);
-    return ["youtube.com", "www.youtube.com", "youtu.be", "www.youtu.be"].includes(
-      url.hostname.toLowerCase(),
-    );
+    const hostname = new URL(sourceUrl).hostname.toLowerCase();
+    if (["youtube.com", "www.youtube.com", "youtu.be", "www.youtu.be"].includes(hostname)) {
+      return VideoSourceType.YOUTUBE;
+    }
+    if (["tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"].includes(hostname)) {
+      return VideoSourceType.TIKTOK;
+    }
+    return null;
   } catch {
-    return false;
+    return null;
   }
 }
 
 @Injectable()
-export class VideosService {
+export class VideosService implements OnModuleInit {
   constructor(private readonly prisma: PrismaService) {}
 
+  async onModuleInit(): Promise<void> {
+    const jobs = await this.prisma.processingJob.findMany({
+      where: { status: { in: ["QUEUED", "RUNNING"] } },
+      orderBy: { createdAt: "asc" },
+    });
+    for (const job of jobs) {
+      void this.runProcess(
+        job.videoId,
+        job.id,
+        (job.checkpoint as PipelineCheckpoint | null) ?? {},
+      );
+    }
+  }
+
   async createFromYouTube(sourceUrl: string) {
-    if (!isYouTubeUrl(sourceUrl)) {
-      throw new BadRequestException("Only YouTube URLs are supported");
+    const sourceType = getSourceType(sourceUrl);
+    if (!sourceType) {
+      throw new BadRequestException("Only YouTube and TikTok URLs are supported");
     }
 
     let response: Response;
@@ -114,6 +134,7 @@ export class VideosService {
     const video = await this.prisma.video.upsert({
       where: { youtubeId: metadata.youtube_id },
       update: {
+        sourceType,
         sourceUrl: metadata.source_url,
         title: metadata.title,
         channel: metadata.channel ?? undefined,
@@ -121,7 +142,7 @@ export class VideosService {
         thumbnailUrl: metadata.thumbnail_url ?? undefined,
       },
       create: {
-        sourceType: VideoSourceType.YOUTUBE,
+        sourceType,
         youtubeId: metadata.youtube_id,
         sourceUrl: metadata.source_url,
         title: metadata.title,
@@ -149,6 +170,7 @@ export class VideosService {
           body: JSON.stringify({
             source_url: video.sourceUrl,
             output_directory: process.env.MEDIA_ROOT ?? "./media/downloads",
+            source_type: video.sourceType,
           }),
         },
       );
@@ -184,6 +206,12 @@ export class VideosService {
     return { videoId, audioPath: extracted.audio_path };
   }
 
+  async getMediaPath(videoId: string): Promise<string> {
+    const video = await this.prisma.video.findUnique({ where: { id: videoId } });
+    if (!video?.mediaPath) throw new BadRequestException("Video media is not available");
+    return video.mediaPath;
+  }
+
   async transcribe(videoId: string, audioPath: string) {
     const result = (await this.callWorker("/transcribe", {
       audio_path: audioPath,
@@ -191,7 +219,7 @@ export class VideosService {
     return { videoId, ...result };
   }
 
-  async process(videoId: string) {
+  async process(videoId: string, force = false) {
     const video = await this.prisma.video.findUnique({ where: { id: videoId } });
     if (!video?.sourceUrl) {
       throw new BadRequestException("Video does not have a source URL");
@@ -201,7 +229,7 @@ export class VideosService {
       where: { videoId },
       orderBy: { createdAt: "desc" },
     });
-    if (latestJob && this.isActiveJob(latestJob)) {
+    if (latestJob && this.isActiveJob(latestJob) && !force) {
       return latestJob;
     }
     if (latestJob?.status === "QUEUED" || latestJob?.status === "RUNNING") {
@@ -220,6 +248,10 @@ export class VideosService {
     });
     void this.runProcess(videoId, job.id, (latestJob?.checkpoint as PipelineCheckpoint | null) ?? {});
     return job;
+  }
+
+  async retry(videoId: string) {
+    return this.process(videoId, true);
   }
 
   async importTranscript(videoId: string, payload: unknown) {
@@ -282,6 +314,7 @@ export class VideosService {
         const downloaded = (await this.callWorker("/youtube/download", {
           source_url: video.sourceUrl,
           output_directory: process.env.MEDIA_ROOT ?? "./media/downloads",
+          source_type: video.sourceType,
         })) as YouTubeDownload;
         await this.ensureJobIsCurrent(jobId);
         checkpoint = { ...checkpoint, mediaPath: downloaded.media_path };
@@ -473,6 +506,8 @@ export class VideosService {
     return this.callWorker("/export/json", {
       video: {
         id: video.id,
+        sourceType: video.sourceType,
+        sourceUrl: video.sourceUrl,
         youtubeId: video.youtubeId,
         title: video.title,
         titleHanzi: video.titleHanzi,

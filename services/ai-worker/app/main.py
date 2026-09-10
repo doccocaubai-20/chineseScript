@@ -86,15 +86,31 @@ def youtube_download(request: YouTubeDownloadRequest) -> dict[str, str]:
                 "fragment_retries": 5,
                 "file_access_retries": 3,
                 "concurrent_fragment_downloads": 1,
-                # Download only the audio stream; the web player embeds YouTube separately.
-                "format": "bestaudio[ext=m4a]/bestaudio/best",
-                "outtmpl": str(output_directory / "%(id)s.audio.%(ext)s"),
+                "format": (
+                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]"
+                    if request.source_type == "TIKTOK"
+                    else "bestaudio[ext=m4a]/bestaudio/best"
+                ),
+                "merge_output_format": "mp4",
+                "outtmpl": str(
+                    output_directory
+                    / (
+                        "%(id)s.video.%(ext)s"
+                        if request.source_type == "TIKTOK"
+                        else "%(id)s.audio.%(ext)s"
+                    )
+                ),
             }
         ) as ydl:
             info = ydl.extract_info(str(request.source_url), download=True)
-            downloaded_path = Path(ydl.prepare_filename(info)).resolve()
+            prepared_path = Path(ydl.prepare_filename(info)).resolve()
+            if request.source_type == "TIKTOK":
+                candidates = sorted(output_directory.glob(f"{info['id']}.video.*"))
+                downloaded_path = (candidates[-1] if candidates else prepared_path).resolve()
+            else:
+                downloaded_path = prepared_path
     except Exception as error:
-        raise HTTPException(status_code=422, detail=f"Unable to download YouTube media: {error}") from error
+        raise HTTPException(status_code=422, detail=f"Unable to download media: {error}") from error
 
     if not downloaded_path.is_file():
         raise HTTPException(status_code=500, detail="yt-dlp completed without creating a media file")
@@ -102,7 +118,7 @@ def youtube_download(request: YouTubeDownloadRequest) -> dict[str, str]:
     max_size_mb = float(os.getenv("MAX_VIDEO_SIZE_MB", "256"))
     if downloaded_path.stat().st_size > max_size_mb * 1024 * 1024:
         downloaded_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=413, detail=f"Downloaded audio exceeds {max_size_mb:g} MB")
+        raise HTTPException(status_code=413, detail=f"Downloaded media exceeds {max_size_mb:g} MB")
 
     return {"youtube_id": str(info["id"]), "media_path": str(downloaded_path)}
 
@@ -118,10 +134,19 @@ def extract_audio_endpoint(request: AudioExtractionRequest) -> dict[str, str]:
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
 def transcribe(request: TranscriptionRequest) -> TranscriptionResponse:
+    audio_path = Path(request.audio_path).resolve()
+    if not audio_path.is_file():
+        raise HTTPException(
+            status_code=422,
+            detail=f"Audio file does not exist: {audio_path}",
+        )
     try:
-        chunks = transcription_provider.transcribe(request.audio_path)
-    except (FileNotFoundError, RuntimeError, OSError) as error:
-        raise HTTPException(status_code=422, detail=f"Transcription failed: {error}") from error
+        chunks = transcription_provider.transcribe(str(audio_path))
+    except (FileNotFoundError, RuntimeError, OSError, ValueError) as error:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Transcription failed for {audio_path}: {error}",
+        ) from error
     return TranscriptionResponse(
         audio_path=request.audio_path,
         language="zh",

@@ -59,6 +59,8 @@ def build_learning_json(video: dict[str, Any], segments: list[dict[str, Any]]) -
         raise ValueError("; ".join(errors))
     return {
         "id": video.get("id"),
+        "sourceType": video.get("sourceType"),
+        "sourceUrl": video.get("sourceUrl"),
         "youtubeId": video.get("youtubeId"),
         "title": video.get("title"),
         "titleHanzi": video.get("titleHanzi"),

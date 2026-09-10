@@ -20,6 +20,7 @@ type Video = {
   durationSec?: number | null;
   thumbnailUrl?: string | null;
   sourceUrl?: string | null;
+  sourceType?: "YOUTUBE" | "TIKTOK" | "UPLOAD";
   status?: string;
   segments?: Segment[];
 };
@@ -31,6 +32,15 @@ type ProcessingJob = {
   progress: number;
   errorMessage?: string | null;
 };
+
+function responseError(text: string, fallback: string): string {
+  try {
+    const parsed = JSON.parse(text) as { message?: string; error?: string };
+    return parsed.message ?? parsed.error ?? fallback;
+  } catch {
+    return text || fallback;
+  }
+}
 
 type YouTubePlayer = {
   seekTo: (seconds: number, allowSeekAhead?: boolean) => void;
@@ -77,8 +87,10 @@ export default function HomePage() {
   const playerRef = useRef<YouTubePlayer | null>(null);
   const playerElementRef = useRef<HTMLDivElement | null>(null);
   const [notice, setNotice] = useState("Dữ liệu mẫu sẵn sàng để chỉnh sửa.");
+  const [errorLog, setErrorLog] = useState("");
   const [transcriptInput, setTranscriptInput] = useState<HTMLInputElement | null>(null);
   const selected = useMemo(() => segments.find((segment) => segment.id === selectedId), [segments, selectedId]);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
 
   useEffect(() => {
     if (!video?.youtubeId || !playerElementRef.current) return;
@@ -119,9 +131,9 @@ export default function HomePage() {
   }, [video?.youtubeId]);
 
   useEffect(() => {
-    if (!playerRef.current || !segments.length) return;
+    if ((!playerRef.current && !localVideoRef.current) || !segments.length) return;
     const timer = window.setInterval(() => {
-      const currentTime = playerRef.current?.getCurrentTime() ?? -1;
+      const currentTime = playerRef.current?.getCurrentTime() ?? localVideoRef.current?.currentTime ?? -1;
       const currentSegment = segments.find(
         (segment) => currentTime >= segment.start && currentTime < segment.end,
       );
@@ -141,12 +153,12 @@ export default function HomePage() {
 
   async function createVideo() {
     if (!url.trim()) {
-      setNotice("Hãy nhập URL YouTube trước.");
+      setNotice("Hãy nhập link YouTube hoặc TikTok trước.");
       return;
     }
 
     setLoading(true);
-    setNotice("Đang đọc metadata từ YouTube...");
+    setNotice("Đang đọc metadata từ video...");
     try {
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/youtube`, {
         method: "POST",
@@ -155,7 +167,7 @@ export default function HomePage() {
       });
       if (!response.ok) {
         const detail = await response.text();
-        throw new Error(detail || "Không thể đọc video YouTube.");
+        throw new Error(detail || "Không thể đọc metadata video.");
       }
       const created = (await response.json()) as Video;
       const mapped = (created.segments ?? []).map((segment) => ({
@@ -182,7 +194,7 @@ export default function HomePage() {
     setNotice("Đã xếp hàng pipeline AI...");
     try {
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}/process`, { method: "POST" });
-      if (!response.ok) throw new Error((await response.text()) || "Pipeline thất bại.");
+      if (!response.ok) throw new Error(responseError(await response.text(), "Pipeline thất bại."));
       await response.json();
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 1500));
@@ -204,7 +216,9 @@ export default function HomePage() {
       setSelectedId(mapped[0]?.id ?? 0);
       setNotice(`Đã tạo ${mapped.length} câu transcript.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Không thể chạy pipeline.");
+      const message = error instanceof Error ? error.message : "Không thể chạy pipeline.";
+      setErrorLog(message);
+      setNotice(`Pipeline lỗi: ${message}`);
     } finally {
       setLoading(false);
     }
@@ -225,7 +239,7 @@ export default function HomePage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
       });
-      if (!response.ok) throw new Error((await response.text()) || "Import transcript thất bại.");
+      if (!response.ok) throw new Error(responseError(await response.text(), "Import transcript thất bại."));
       await response.json();
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -246,8 +260,29 @@ export default function HomePage() {
       setSelectedId(mapped[0]?.id ?? 0);
       setNotice(`Đã import và tạo ${mapped.length} câu transcript.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Import transcript thất bại.");
+      const message = error instanceof Error ? error.message : "Import transcript thất bại.";
+      setErrorLog(message);
+      setNotice(`Import lỗi: ${message}`);
     } finally {
+      setLoading(false);
+    }
+
+  }
+
+  async function retryPipeline() {
+    if (!video) return;
+    setLoading(true);
+    setErrorLog("");
+    setNotice("Đang retry từ checkpoint gần nhất...");
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}/retry`, { method: "POST" });
+      if (!response.ok) throw new Error(responseError(await response.text(), "Retry thất bại."));
+      await response.json();
+      await processVideo();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Retry thất bại.";
+      setErrorLog(message);
+      setNotice(`Retry lỗi: ${message}`);
       setLoading(false);
     }
   }
@@ -332,8 +367,8 @@ export default function HomePage() {
 
       <section className="source-card">
         <div>
-          <label htmlFor="youtube-url">YouTube URL</label>
-          <input id="youtube-url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://www.youtube.com/watch?v=..." />
+          <label htmlFor="youtube-url">Link YouTube hoặc TikTok</label>
+          <input id="youtube-url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://www.youtube.com/... hoặc https://www.tiktok.com/..." />
         </div>
         <button className="primary" onClick={createVideo} disabled={loading}>{loading ? "Đang xử lý..." : "Tạo transcript"}</button>
       </section>
@@ -345,6 +380,7 @@ export default function HomePage() {
           <div className="actions">
             <button className="ghost" onClick={() => transcriptInput?.click()} disabled={!video}>Import transcript.json</button>
             <button className="primary" onClick={processVideo} disabled={loading}>{loading ? "Đang chạy..." : "Chạy pipeline"}</button>
+            <button className="ghost" onClick={retryPipeline} disabled={loading}>Retry từ checkpoint</button>
             <input
               ref={setTranscriptInput}
               type="file"
@@ -360,13 +396,24 @@ export default function HomePage() {
         </section>
       )}
 
+      {errorLog && <pre className="error-log">{errorLog}</pre>}
+
       <div className="workspace">
         <section className="panel player-panel">
           <div className="panel-heading">
             <div><span className="eyebrow">VIDEO</span><h2>Playback</h2></div>
             <span className="count">{activeSegmentId ? `Câu ${activeSegmentId}` : "Chưa phát"}</span>
           </div>
-          {video?.youtubeId ? <div className="player-frame" ref={playerElementRef} /> : <p className="empty">Tạo video YouTube để hiển thị player.</p>}
+          {video?.sourceType === "YOUTUBE" && video.youtubeId ? (
+            <div className="player-frame" ref={playerElementRef} />
+          ) : video?.sourceType === "TIKTOK" ? (
+            <video
+              className="player-frame"
+              ref={localVideoRef}
+              controls
+              src={`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}/videos/${video.id}/media`}
+            />
+          ) : <p className="empty">Chưa có video để phát.</p>}
         </section>
         <section className="panel transcript-panel">
           <div className="panel-heading">

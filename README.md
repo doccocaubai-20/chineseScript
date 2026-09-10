@@ -15,6 +15,28 @@ YouTube audio -> FFmpeg -> faster-whisper -> sentence alignment
 - `packages/contracts`: shared TypeScript contract types.
 - `docs`: architecture and JSON export contract.
 
+## Tải TikTok nhanh
+
+Không cần Docker, API hay web app. Cài `yt-dlp` một lần:
+
+```powershell
+python -m pip install yt-dlp
+```
+
+Sau đó chạy công cụ độc lập và dán link TikTok:
+
+```powershell
+.\scripts\download-tiktok.ps1
+```
+
+Hoặc truyền link trực tiếp:
+
+```powershell
+.\scripts\download-tiktok.ps1 "https://www.tiktok.com/@user/video/123"
+```
+
+Video được lưu trong `media\tiktok`.
+
 ## Prerequisites
 
 - Node.js 20+

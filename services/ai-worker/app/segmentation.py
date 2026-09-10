@@ -1,4 +1,5 @@
 import re
+import os
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -24,6 +25,8 @@ def _clean_hanzi(text: str) -> str:
 def align_sentences(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     aligned: list[AlignedSegment] = []
     current_words: list[dict[str, Any]] = []
+    max_duration = max(5.0, float(os.getenv("MAX_SEGMENT_DURATION_SEC", "20")))
+    max_characters = max(10, int(os.getenv("MAX_SEGMENT_CHARACTERS", "45")))
 
     def flush() -> None:
         if not current_words:
@@ -55,6 +58,16 @@ def align_sentences(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
 
         for word in words:
+            if current_words:
+                previous_end = float(current_words[-1].get("end", 0))
+                current_start = float(current_words[0].get("start", 0))
+                current_text = "".join(str(item.get("text", "")) for item in current_words)
+                if (
+                    float(word.get("start", previous_end)) - previous_end >= 0.8
+                    or float(word.get("end", current_start)) - current_start >= max_duration
+                    or len(current_text) >= max_characters
+                ):
+                    flush()
             current_words.append(word)
             if any(mark in str(word.get("text", "")) for mark in SENTENCE_ENDINGS):
                 flush()
