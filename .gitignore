@@ -16,3 +16,4 @@ services/ai-worker/__pycache__/
 **/__pycache__/
 services/ai-worker/.pytest_cache/
 transcribe-request.json
+output/
